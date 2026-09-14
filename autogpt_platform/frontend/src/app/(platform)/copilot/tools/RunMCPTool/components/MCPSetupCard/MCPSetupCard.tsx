@@ -25,7 +25,7 @@ import {
 } from "@/lib/mcp-auth";
 import { getAPIResponseError, getErrorStatus } from "@/lib/mcp-errors";
 import { normalizeMcpUrl } from "@/lib/mcp-url";
-import { openOAuthPopup } from "@/lib/oauth-popup";
+import { openOAuthPopup, preOpenOAuthPopup } from "@/lib/oauth-popup";
 import { CredentialsProvidersContext } from "@/providers/agent-credentials/credentials-provider";
 import { useContext, useEffect, useId, useRef, useState } from "react";
 import { useCopilotChatActions } from "../../../../components/CopilotChatActionsProvider/useCopilotChatActions";
@@ -148,6 +148,10 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
   // on the next attempt so the user can retry.
   const [forceDisconnected, setForceDisconnected] = useState(false);
   const oauthAbortRef = useRef<(() => void) | null>(null);
+  const preOpenedWindowRef = useRef<Window | null>(null);
+  const isUnmountedRef = useRef(false);
+  const attemptRef = useRef(0);
+  const loadingRef = useRef(false);
 
   // Combined view:
   //   1. ``forceDisconnected`` (set by the catch block) wins.
@@ -167,7 +171,19 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
   const setConnected = setLocalConnected;
 
   // Abort any in-progress OAuth popup when the component unmounts.
-  useEffect(() => () => oauthAbortRef.current?.(), []);
+  useEffect(() => {
+    isUnmountedRef.current = false;
+    return () => {
+      isUnmountedRef.current = true;
+      attemptRef.current += 1;
+      loadingRef.current = false;
+      oauthAbortRef.current?.();
+      if (preOpenedWindowRef.current && !preOpenedWindowRef.current.closed) {
+        preOpenedWindowRef.current.close();
+      }
+      preOpenedWindowRef.current = null;
+    };
+  }, []);
 
   async function handleConnect() {
     // Re-entrancy guard: a rapid double-click would otherwise race the
@@ -178,13 +194,17 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
     // attempt is still alive.  Bail out cheaply when a flow is already
     // running.  Button is also ``disabled={loading}`` but disabled
     // <button> elements still fire ``click`` in some browsers.
-    if (loading) return;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    const attempt = ++attemptRef.current;
     setError(null);
     // Reset showManualToken so a prior 400 doesn't keep the input visible
     // when a later attempt fails with a non-400 (e.g. network) error.
     setShowManualToken(false);
     setLoading(true);
     oauthAbortRef.current?.();
+    const preOpenedWindow = preOpenOAuthPopup();
+    preOpenedWindowRef.current = preOpenedWindow;
 
     try {
       // Only a 400 from the *initiate* call means "this server has no OAuth
@@ -204,6 +224,11 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
         }
       } catch (e: unknown) {
         if (getErrorStatus(e) === 400) {
+          if (isUnmountedRef.current || attemptRef.current !== attempt) return;
+          if (preOpenedWindow && !preOpenedWindow.closed) {
+            preOpenedWindow.close();
+          }
+          preOpenedWindowRef.current = null;
           setConnected(false);
           setForceDisconnected(true);
           setShowManualToken(true);
@@ -218,14 +243,18 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
         login_url: string;
         state_token: string;
       };
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
 
       const { promise, cleanup } = openOAuthPopup(login_url, {
         stateToken: state_token,
+        preOpenedWindow,
         useCrossOriginListeners: true,
       });
+      preOpenedWindowRef.current = null;
       oauthAbortRef.current = cleanup.abort;
 
       const result = await promise;
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
 
       const mcpProvider = allProviders?.["mcp"];
       if (mcpProvider) {
@@ -245,6 +274,8 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
         }
       }
 
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
+
       // Only clear the force-disconnect override AFTER the OAuth dance
       // completes successfully.  Clearing it earlier would let
       // ``liveHasCred=true`` (Reconnect path) render the Connected pill
@@ -254,6 +285,13 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
       setConnected(true);
       onSend(retryInstruction ?? "I've connected. Please retry.");
     } catch (e: unknown) {
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
+      if (preOpenedWindowRef.current === preOpenedWindow) {
+        preOpenedWindowRef.current = null;
+        if (preOpenedWindow && !preOpenedWindow.closed) {
+          preOpenedWindow.close();
+        }
+      }
       const err = e as Record<string, unknown>;
       // Reconnect failures must drop the Connected view so the user sees
       // the error / manual-token input rendered by the not-connected
@@ -276,8 +314,11 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
         setError(msg);
       }
     } finally {
-      setLoading(false);
-      oauthAbortRef.current = null;
+      if (attemptRef.current === attempt) {
+        loadingRef.current = false;
+        setLoading(false);
+        oauthAbortRef.current = null;
+      }
     }
   }
 
@@ -285,7 +326,7 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
     // Re-entrancy guard first — mirrors ``handleConnect`` so both flows
     // present the same shape to readers.  See the comment on
     // ``handleConnect``'s guard for the double-click race this prevents.
-    if (loading) return;
+    if (loadingRef.current) return;
     // Chain rows pass an already-prepared value; do not prepare it again.
     const token =
       tokenArg === undefined
@@ -303,6 +344,8 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
       return;
     }
 
+    loadingRef.current = true;
+    const attempt = ++attemptRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -322,6 +365,7 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
             : "This server did not accept the credential.",
         );
       }
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
 
       const res = await postV2StoreABearerTokenForAnMcpServer({
         server_url: serverUrl,
@@ -336,6 +380,7 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
           typeof detail === "string" ? detail : "Failed to store token",
         );
       }
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
       // Only clear the force-disconnect override AFTER the API confirms
       // the token was stored.  Clearing it before the await would let
       // ``liveHasCred=true`` (from an existing stale cred) re-render the
@@ -345,6 +390,7 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
       setConnected(true);
       onSend(retryInstruction ?? "I've connected. Please retry.");
     } catch (e: unknown) {
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
       // Keep the force-disconnect override on so the not-connected
       // branch (error banner + manual-token input) stays visible — an
       // existing ``liveHasCred=true`` would otherwise re-render the
@@ -356,7 +402,10 @@ export function MCPSetupCard({ output, retryInstruction }: Props) {
           "Failed to save token. Please try again.",
       );
     } finally {
-      setLoading(false);
+      if (attemptRef.current === attempt) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
     }
   }
 

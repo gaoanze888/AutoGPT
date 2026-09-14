@@ -33,7 +33,7 @@ import {
   getErrorStatus,
 } from "@/lib/mcp-errors";
 import { mcpServerIdentity, normalizeMcpUrl } from "@/lib/mcp-url";
-import { openOAuthPopup } from "@/lib/oauth-popup";
+import { openOAuthPopup, preOpenOAuthPopup } from "@/lib/oauth-popup";
 import { invalidateConnectionQueries } from "@/lib/react-query/invalidateConnections";
 
 interface Props {
@@ -55,8 +55,24 @@ export function McpConnectPanel({ onSuccess }: Props) {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const oauthAbortRef = useRef<((reason?: string) => void) | null>(null);
+  const preOpenedWindowRef = useRef<Window | null>(null);
+  const isUnmountedRef = useRef(false);
+  const attemptRef = useRef(0);
+  const isSubmittingRef = useRef(false);
 
-  useEffect(() => () => oauthAbortRef.current?.(), []);
+  useEffect(() => {
+    isUnmountedRef.current = false;
+    return () => {
+      isUnmountedRef.current = true;
+      attemptRef.current += 1;
+      isSubmittingRef.current = false;
+      oauthAbortRef.current?.();
+      if (preOpenedWindowRef.current && !preOpenedWindowRef.current.closed) {
+        preOpenedWindowRef.current.close();
+      }
+      preOpenedWindowRef.current = null;
+    };
+  }, []);
 
   const trimmedUrl = serverUrl.trim();
   const trimmedToken = token.trim();
@@ -85,10 +101,14 @@ export function McpConnectPanel({ onSuccess }: Props) {
   }
 
   async function handleConnect() {
-    if (!canConnect) return;
+    if (!isUrlValid || isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
+    const attempt = ++attemptRef.current;
     setError(null);
     setIsSubmitting(true);
     oauthAbortRef.current?.();
+    const preOpenedWindow = preOpenOAuthPopup();
+    preOpenedWindowRef.current = preOpenedWindow;
 
     try {
       // Only a 400 from the *initiate* call means "server doesn't support
@@ -107,6 +127,11 @@ export function McpConnectPanel({ onSuccess }: Props) {
         }
       } catch (e: unknown) {
         if (getErrorStatus(e) === 400) {
+          if (isUnmountedRef.current || attemptRef.current !== attempt) return;
+          if (preOpenedWindow && !preOpenedWindow.closed) {
+            preOpenedWindow.close();
+          }
+          preOpenedWindowRef.current = null;
           setPhase("manual-token");
           setError(
             "This server doesn't support OAuth sign-in. Choose how its API credential should be sent.",
@@ -117,14 +142,18 @@ export function McpConnectPanel({ onSuccess }: Props) {
       }
 
       const { login_url, state_token } = loginRes.data as MCPOAuthLoginResponse;
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
 
       const { promise, cleanup } = openOAuthPopup(login_url, {
         stateToken: state_token,
+        preOpenedWindow,
         useCrossOriginListeners: true,
       });
+      preOpenedWindowRef.current = null;
       oauthAbortRef.current = cleanup.abort;
 
       const result = await promise;
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
 
       const exchanged = await postV2ExchangeOauthCodeForMcpTokens({
         code: result.code,
@@ -134,10 +163,19 @@ export function McpConnectPanel({ onSuccess }: Props) {
       if (exchanged.status !== 200) {
         throw getAPIResponseError(exchanged.status, exchanged.data);
       }
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
 
       await invalidateCredentials();
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
       onSuccess(exchanged.data);
     } catch (e: unknown) {
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
+      if (preOpenedWindowRef.current === preOpenedWindow) {
+        preOpenedWindowRef.current = null;
+        if (preOpenedWindow && !preOpenedWindow.closed) {
+          preOpenedWindow.close();
+        }
+      }
       const message = getErrorMessage(e);
       if (message === "OAuth flow timed out") {
         setError("OAuth sign-in timed out. Please try again.");
@@ -145,13 +183,16 @@ export function McpConnectPanel({ onSuccess }: Props) {
         setError(message);
       }
     } finally {
-      setIsSubmitting(false);
-      oauthAbortRef.current = null;
+      if (attemptRef.current === attempt) {
+        isSubmittingRef.current = false;
+        setIsSubmitting(false);
+        oauthAbortRef.current = null;
+      }
     }
   }
 
   async function handleSubmitToken() {
-    if (!canSubmitToken) return;
+    if (!isUrlValid || !trimmedToken || isSubmittingRef.current) return;
 
     const invalid = validateMCPAuthCredential(trimmedToken, authScheme);
     if (invalid) {
@@ -159,6 +200,8 @@ export function McpConnectPanel({ onSuccess }: Props) {
       return;
     }
 
+    isSubmittingRef.current = true;
+    const attempt = ++attemptRef.current;
     setError(null);
     setIsSubmitting(true);
 
@@ -173,6 +216,7 @@ export function McpConnectPanel({ onSuccess }: Props) {
       if (probe.status !== 200) {
         throw getAPIResponseError(probe.status, probe.data);
       }
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
 
       const stored = await postV2StoreABearerTokenForAnMcpServer({
         server_url: trimmedUrl,
@@ -181,13 +225,19 @@ export function McpConnectPanel({ onSuccess }: Props) {
       if (stored.status !== 200) {
         throw getAPIResponseError(stored.status, stored.data);
       }
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
 
       await invalidateCredentials();
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
       onSuccess(stored.data);
     } catch (e: unknown) {
+      if (isUnmountedRef.current || attemptRef.current !== attempt) return;
       setError(getErrorMessage(e));
     } finally {
-      setIsSubmitting(false);
+      if (attemptRef.current === attempt) {
+        isSubmittingRef.current = false;
+        setIsSubmitting(false);
+      }
     }
   }
 

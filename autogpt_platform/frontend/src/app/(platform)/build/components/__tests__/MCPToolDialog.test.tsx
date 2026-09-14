@@ -22,6 +22,7 @@ vi.mock("@/app/api/__generated__/endpoints/mcp/mcp", () => ({
 
 vi.mock("@/lib/oauth-popup", () => ({
   openOAuthPopup: vi.fn(),
+  preOpenOAuthPopup: vi.fn(() => null),
 }));
 
 const PRIVATE_SERVER_URL = "https://private.example.com/mcp";
@@ -86,6 +87,56 @@ async function connectPrivateServer() {
 describe("MCPToolDialog credential binding", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("pre-opens from the discovery click before OAuth initiation", async () => {
+    const fakeWindow = { closed: false, close: vi.fn() };
+    const callOrder: string[] = [];
+    const { openOAuthPopup, preOpenOAuthPopup } = await import(
+      "@/lib/oauth-popup"
+    );
+    vi.mocked(preOpenOAuthPopup).mockImplementation(() => {
+      callOrder.push("pre-open");
+      return fakeWindow as unknown as Window;
+    });
+    const {
+      postV2DiscoverAvailableToolsOnAnMcpServer,
+      postV2InitiateOauthLoginForAnMcpServer,
+    } = await import("@/app/api/__generated__/endpoints/mcp/mcp");
+    vi.mocked(postV2DiscoverAvailableToolsOnAnMcpServer).mockImplementation(
+      async () => {
+        callOrder.push("discover");
+        return apiResponse(401, { detail: "Authentication required" });
+      },
+    );
+    vi.mocked(postV2InitiateOauthLoginForAnMcpServer).mockImplementation(
+      async () => {
+        callOrder.push("initiate");
+        return apiResponse(200, {
+          login_url: "https://auth.example.com/authorize",
+          state_token: "st",
+        });
+      },
+    );
+    vi.mocked(openOAuthPopup).mockReturnValueOnce({
+      promise: new Promise(() => {}),
+      cleanup: { abort: vi.fn(), signal: new AbortController().signal },
+      popupBlocked: false,
+      fallbackBlocked: false,
+    });
+
+    render(<MCPToolDialog open onClose={() => {}} onConfirm={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: PRIVATE_SERVER_URL },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Discover Tools" }));
+
+    await waitFor(() => expect(openOAuthPopup).toHaveBeenCalled());
+    expect(callOrder).toEqual(["pre-open", "discover", "initiate"]);
+    expect(openOAuthPopup).toHaveBeenCalledWith(
+      "https://auth.example.com/authorize",
+      expect.objectContaining({ preOpenedWindow: fakeWindow }),
+    );
   });
 
   it("surfaces a rejected authorization response instead of offering a token", async () => {

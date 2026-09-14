@@ -11,6 +11,7 @@ import { McpConnectPanel } from "../McpConnectPanel";
 
 vi.mock("@/lib/oauth-popup", () => ({
   openOAuthPopup: vi.fn(),
+  preOpenOAuthPopup: vi.fn(() => null),
 }));
 
 vi.mock("@/app/api/__generated__/endpoints/mcp/mcp", () => ({
@@ -86,6 +87,112 @@ describe("McpConnectPanel", () => {
       target: { value: "https://mcp.example.com" },
     });
     expect((connectButton as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("pre-opens before initiation and closes the window when initiation fails", async () => {
+    const fakeWindow = { closed: false, close: vi.fn() };
+    const callOrder: string[] = [];
+    const { openOAuthPopup, preOpenOAuthPopup } = await import(
+      "@/lib/oauth-popup"
+    );
+    vi.mocked(preOpenOAuthPopup).mockImplementation(() => {
+      callOrder.push("pre-open");
+      return fakeWindow as unknown as Window;
+    });
+    const { postV2InitiateOauthLoginForAnMcpServer } = await import(
+      "@/app/api/__generated__/endpoints/mcp/mcp"
+    );
+    vi.mocked(postV2InitiateOauthLoginForAnMcpServer).mockImplementation(
+      async () => {
+        callOrder.push("initiate");
+        throw makeApiError(500, "initiation failed");
+      },
+    );
+
+    render(<McpConnectPanel onSuccess={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/server url/i), {
+      target: { value: "https://mcp.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /connect/i }));
+
+    await screen.findByText("initiation failed");
+    expect(callOrder).toEqual(["pre-open", "initiate"]);
+    expect(fakeWindow.close).toHaveBeenCalledOnce();
+    expect(openOAuthPopup).not.toHaveBeenCalled();
+  });
+
+  it("closes the pre-opened window without adopting it after unmount", async () => {
+    const fakeWindow = { closed: false, close: vi.fn() };
+    const { openOAuthPopup, preOpenOAuthPopup } = await import(
+      "@/lib/oauth-popup"
+    );
+    vi.mocked(preOpenOAuthPopup).mockReturnValue(
+      fakeWindow as unknown as Window,
+    );
+    let resolveInitiate: (value: unknown) => void = () => {};
+    const { postV2InitiateOauthLoginForAnMcpServer } = await import(
+      "@/app/api/__generated__/endpoints/mcp/mcp"
+    );
+    vi.mocked(postV2InitiateOauthLoginForAnMcpServer).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveInitiate = resolve;
+        }) as never,
+    );
+
+    const view = render(<McpConnectPanel onSuccess={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/server url/i), {
+      target: { value: "https://mcp.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /connect/i }));
+    view.unmount();
+
+    expect(fakeWindow.close).toHaveBeenCalledOnce();
+    resolveInitiate({
+      status: 200,
+      data: { login_url: "https://login.example.com", state_token: "tok" },
+      headers: new Headers(),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(openOAuthPopup).not.toHaveBeenCalled();
+  });
+
+  it("passes the pre-opened window to the OAuth listener", async () => {
+    const fakeWindow = { closed: false, close: vi.fn() };
+    const { openOAuthPopup, preOpenOAuthPopup } = await import(
+      "@/lib/oauth-popup"
+    );
+    vi.mocked(preOpenOAuthPopup).mockReturnValue(
+      fakeWindow as unknown as Window,
+    );
+    const { postV2InitiateOauthLoginForAnMcpServer } = await import(
+      "@/app/api/__generated__/endpoints/mcp/mcp"
+    );
+    vi.mocked(postV2InitiateOauthLoginForAnMcpServer).mockResolvedValueOnce({
+      status: 200,
+      data: { login_url: "https://login.example.com", state_token: "tok" },
+      headers: new Headers(),
+    } as never);
+    vi.mocked(openOAuthPopup).mockReturnValueOnce({
+      promise: new Promise(() => {}),
+      cleanup: { abort: vi.fn() },
+    } as never);
+
+    render(<McpConnectPanel onSuccess={() => {}} />);
+    fireEvent.change(screen.getByLabelText(/server url/i), {
+      target: { value: "https://mcp.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /connect/i }));
+
+    await waitFor(() =>
+      expect(openOAuthPopup).toHaveBeenCalledWith(
+        "https://login.example.com",
+        expect.objectContaining({
+          stateToken: "tok",
+          preOpenedWindow: fakeWindow,
+        }),
+      ),
+    );
   });
 
   it("falls back to manual-token form when initiate returns 400", async () => {

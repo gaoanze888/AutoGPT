@@ -30,6 +30,7 @@ vi.mock(
 // Mock the OAuth popup utility
 vi.mock("@/lib/oauth-popup", () => ({
   openOAuthPopup: vi.fn(),
+  preOpenOAuthPopup: vi.fn(() => null),
 }));
 
 // Mock the generated API functions
@@ -214,6 +215,52 @@ describe("MCPSetupCard", () => {
     render(<MCPSetupCard output={makeSetupOutput(undefined, true)} />);
     expect(screen.getByText(/connected to example\.com/i)).toBeDefined();
     expect(screen.getByRole("button", { name: /reconnect/i })).toBeDefined();
+  });
+
+  it("pre-opens before initiation and hands the window to OAuth", async () => {
+    const fakeWindow = { closed: false, close: vi.fn() };
+    const callOrder: string[] = [];
+    const { openOAuthPopup, preOpenOAuthPopup } = await import(
+      "@/lib/oauth-popup"
+    );
+    vi.mocked(preOpenOAuthPopup).mockImplementation(() => {
+      callOrder.push("pre-open");
+      return fakeWindow as unknown as Window;
+    });
+    const { postV2InitiateOauthLoginForAnMcpServer } = await import(
+      "@/app/api/__generated__/endpoints/mcp/mcp"
+    );
+    vi.mocked(postV2InitiateOauthLoginForAnMcpServer).mockImplementation(
+      async () => {
+        callOrder.push("initiate");
+        return {
+          status: 200,
+          data: {
+            login_url: "https://auth.example.com/authorize",
+            state_token: "st",
+          },
+          headers: new Headers(),
+        } as never;
+      },
+    );
+    vi.mocked(openOAuthPopup).mockReturnValueOnce({
+      promise: new Promise(() => {}),
+      cleanup: { abort: vi.fn(), signal: new AbortController().signal },
+      popupBlocked: false,
+      fallbackBlocked: false,
+    });
+
+    render(<MCPSetupCard output={makeSetupOutput()} />);
+    fireEvent.click(
+      screen.getByRole("button", { name: /connect example\.com/i }),
+    );
+
+    await waitFor(() => expect(openOAuthPopup).toHaveBeenCalled());
+    expect(callOrder).toEqual(["pre-open", "initiate"]);
+    expect(openOAuthPopup).toHaveBeenCalledWith(
+      "https://auth.example.com/authorize",
+      expect.objectContaining({ preOpenedWindow: fakeWindow }),
+    );
   });
 
   it("shows manual token input after OAuth 400", async () => {
